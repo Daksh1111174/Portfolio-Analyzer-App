@@ -1,136 +1,144 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
+import yfinance as yf
+from ta.momentum import RSIIndicator
 
-st.set_page_config(page_title="📊 Portfolio Analyzer", layout="wide")
-st.title("📈 Portfolio Analyzer – Buy / Hold / Sell")
+st.set_page_config(page_title="🧠 Ultimate Portfolio Analyzer", layout="centered")
 
-uploaded_file = st.file_uploader("Upload Holdings CSV", type=["csv"])
+st.title("📊 Ultimate Portfolio Analyzer (Live + AI)")
+st.caption("Live prices • Real RSI • AI Rebalancing • Risk-based Strategy")
+
+# -----------------------------
+# Investor Profile
+# -----------------------------
+risk_profile = st.selectbox(
+    "🧠 Select Investor Risk Profile",
+    ["Conservative", "Moderate", "Aggressive"]
+)
+
+risk_rules = {
+    "Conservative": {"sl": 0.92, "target": 1.10},
+    "Moderate": {"sl": 0.90, "target": 1.20},
+    "Aggressive": {"sl": 0.85, "target": 1.35}
+}
+
+uploaded_file = st.file_uploader("Upload Broker Holdings CSV", type=["csv"])
 
 if uploaded_file:
 
     # -----------------------------
-    # Read raw file
+    # Read & detect header
     # -----------------------------
     raw = pd.read_csv(uploaded_file, header=None)
-
-    # -----------------------------
-    # Find header row automatically
-    # -----------------------------
-    header_row = None
-    for i in range(len(raw)):
-        if raw.iloc[i].astype(str).str.contains("Symbol", case=False).any():
-            header_row = i
-            break
+    header_row = next(
+        (i for i in range(len(raw)) if raw.iloc[i].astype(str).str.contains("symbol", case=False).any()),
+        None
+    )
 
     if header_row is None:
-        st.error("❌ Could not detect header row. Please upload valid holdings file.")
+        st.error("Invalid holdings file")
         st.stop()
 
-    # -----------------------------
-    # Create clean dataframe
-    # -----------------------------
     raw.columns = raw.iloc[header_row]
     df = raw.iloc[header_row + 1:].reset_index(drop=True)
-
-    # -----------------------------
-    # Normalize column names
-    # -----------------------------
     df.columns = [str(c).strip().lower() for c in df.columns]
 
-    def find_col(keyword):
-        for col in df.columns:
-            if keyword in col:
-                return col
-        return None
+    def col(key):
+        return next(c for c in df.columns if key in c)
 
-    col_symbol = find_col("symbol")
-    col_qty = find_col("qty")
-    col_buy = find_col("avg")
-    col_ltp = find_col("ltp")
-    col_value = find_col("current")
-    col_return = find_col("%")
+    df = df[[col("symbol"), col("qty"), col("avg"), col("ltp"), col("current")]]
+    df.columns = ["Symbol", "Quantity", "BuyPrice", "CurrentPrice", "CurrentValue"]
 
-    required = [col_symbol, col_qty, col_buy, col_ltp, col_value, col_return]
-    if any(c is None for c in required):
-        st.error("❌ Required columns not found in file")
-        st.write("Detected columns:", df.columns.tolist())
-        st.stop()
-
-    df = df[required]
-    df.columns = ["Symbol", "Quantity", "BuyPrice", "CurrentPrice", "CurrentValue", "Return_%"]
+    for c in df.columns[1:]:
+        df[c] = df[c].astype(str).str.replace(",", "").astype(float)
 
     # -----------------------------
-    # Clean data
+    # 🔴 Live Prices + RSI
     # -----------------------------
-    for col in ["Quantity", "BuyPrice", "CurrentPrice", "CurrentValue"]:
-        df[col] = (
-            df[col]
-            .astype(str)
-            .str.replace(",", "")
-            .astype(float)
+    st.subheader("🔴 Live Market Data")
+
+    prices, rsis = [], []
+
+    with st.spinner("Fetching live prices & RSI..."):
+        for sym in df["Symbol"]:
+            try:
+                ticker = yf.Ticker(sym + ".NS")
+                hist = ticker.history(period="3mo")
+                close = hist["Close"]
+
+                prices.append(close.iloc[-1])
+                rsi = RSIIndicator(close, window=14).rsi().iloc[-1]
+                rsis.append(round(rsi, 2))
+            except:
+                prices.append(np.nan)
+                rsis.append(np.nan)
+
+    df["LivePrice"] = prices
+    df["RSI"] = rsis
+
+    # -----------------------------
+    # Returns & Risk Levels
+    # -----------------------------
+    df["Return_%"] = (df["LivePrice"] - df["BuyPrice"]) / df["BuyPrice"] * 100
+
+    sl = risk_rules[risk_profile]["sl"]
+    tg = risk_rules[risk_profile]["target"]
+
+    df["StopLoss"] = df["LivePrice"] * sl
+    df["Target"] = df["LivePrice"] * tg
+
+    # -----------------------------
+    # 🤖 AI Rebalancing Logic
+    # -----------------------------
+    def ai_action(row):
+        if row["RSI"] > 70:
+            return "Reduce 🔻"
+        elif row["RSI"] < 30:
+            return "Add 🔼"
+        elif row["Return_%"] > 25 and risk_profile == "Conservative":
+            return "Book Profit 💰"
+        else:
+            return "Hold ⏸"
+
+    df["AI_Action"] = df.apply(ai_action, axis=1)
+
+    # -----------------------------
+    # Sell Priority
+    # -----------------------------
+    df["SellScore"] = (df["RSI"] > 70) * 2 + (df["Return_%"] < -10)
+    df["SellPriority"] = df["SellScore"].rank(ascending=False)
+
+    # -----------------------------
+    # Dashboard (Mobile Friendly)
+    # -----------------------------
+    st.metric("💰 Portfolio Value", f"₹{df['CurrentValue'].sum():,.0f}")
+    st.metric("📊 Avg Return %", round(df["Return_%"].mean(), 2))
+
+    with st.expander("📋 Stock-wise AI Analysis"):
+        st.dataframe(
+            df[[
+                "Symbol", "LivePrice", "RSI", "Return_%",
+                "StopLoss", "Target", "AI_Action", "SellPriority"
+            ]].sort_values("SellPriority"),
+            use_container_width=True
         )
 
-    df["Return_%"] = (
-        df["Return_%"]
-        .astype(str)
-        .str.replace("%", "")
-        .str.replace(",", "")
-        .astype(float)
-    )
-
     # -----------------------------
-    # Recommendation logic
+    # Charts
     # -----------------------------
-    def recommend(r):
-        if r < -10:
-            return "SELL ❌"
-        elif -10 <= r <= 10:
-            return "HOLD ⏸"
-        else:
-            return "HOLD / ADD ✅"
-
-    df["Recommendation"] = df["Return_%"].apply(recommend)
-
-    # -----------------------------
-    # KPIs
-    # -----------------------------
-    col1, col2, col3 = st.columns(3)
-    col1.metric("💰 Portfolio Value", f"₹{df['CurrentValue'].sum():,.0f}")
-    col2.metric("📊 Stocks", len(df))
-    col3.metric("📈 Avg Return %", round(df["Return_%"].mean(), 2))
-
-    st.divider()
-
-    # -----------------------------
-    # Filters
-    # -----------------------------
-    choice = st.selectbox(
-        "Filter Recommendation",
-        ["All", "SELL ❌", "HOLD ⏸", "HOLD / ADD ✅"]
-    )
-
-    show_df = df if choice == "All" else df[df["Recommendation"] == choice]
-
-    st.dataframe(
-        show_df.sort_values("Return_%"),
-        use_container_width=True
-    )
-
-    # -----------------------------
-    # Chart
-    # -----------------------------
-    st.subheader("📊 Stock Returns")
-    st.bar_chart(show_df.set_index("Symbol")["Return_%"])
+    st.subheader("📈 RSI Levels")
+    st.bar_chart(df.set_index("Symbol")["RSI"])
 
     # -----------------------------
     # Download
     # -----------------------------
     st.download_button(
-        "📥 Download CSV",
-        show_df.to_csv(index=False),
-        "portfolio_recommendations.csv",
+        "📥 Download AI Portfolio Report",
+        df.to_csv(index=False),
+        "ai_portfolio_report.csv",
         "text/csv"
     )
 
 else:
-    st.info("👆 Upload your broker holdings CSV to begin")
+    st.info("Upload your holdings CSV to begin analysis")
